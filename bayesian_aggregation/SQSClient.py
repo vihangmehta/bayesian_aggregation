@@ -105,6 +105,7 @@ class SQSOfflineClient:
         self.messagesFilename = filename
 
         self.mTimes = {}
+        self.fSizes = {}
         self.allMessages = []
         self.parsedCount = 0
         self.removeAnonUsers = removeAnonUsers
@@ -116,49 +117,71 @@ class SQSOfflineClient:
         else:
             self.trainingFWHM = None
 
-        self.loadMessages()
+        self.loadInitialMessages()
 
-    def loadMessages(self):
+    def readPickleFile(self,filename):
 
-        for filename in np.atleast_1d(self.messagesFilename):
-            with open(filename,'rb') as pklfile:
-                messages = pickle.load(pklfile)
-                if self.removeAnonUsers:
-                    messages = [x for x in messages if x["user_id"] is not None]
-                if self.trainingMessagesOnly:
-                    messages = [x for x in messages if x["data"]["classification"]["subject"]["metadata"]["origin"]=="training"]
-                self.allMessages.extend(messages)
-            self.mTimes[filename] = os.stat(filename).st_mtime
-
-        self.messageIds = np.arange(len(self.allMessages))
-        print("SQSOfflineClient: Loaded {} messages ...".format(len(self.allMessages)))
-
-    def update(self):
-
-        update = []
-        for filename in np.atleast_1d(self.messagesFilename):
-            update.append(os.stat(filename).st_mtime > self.mTimes[filename])
-
-        if any(update):
-
-            allMessages = []
-            for filename in np.atleast_1d(self.messagesFilename):
+        while True:
+            try:
                 with open(filename,'rb') as pklfile:
                     messages = pickle.load(pklfile)
-                    if self.removeAnonUsers:
-                        messages = [x for x in messages if x["user_id"] is not None]
-                    if self.trainingMessagesOnly:
-                        messages = [x for x in messages if x["data"]["classification"]["subject"]["metadata"]["origin"]=="training"]
-                    allMessages.extend(messages)
-                self.mTimes[filename] = os.stat(filename).st_mtime
+                break
+            except EOFError:
+                print("SQSOfflineClient: Encountered EOFError; Retrying {} in 10s".format(pklfile))
+                time.sleep(10)
 
-            cond = np.in1d([_["classification_id"] for _ in allMessages],
+        self.mTimes[filename] = os.stat(filename).st_mtime
+        self.fSizes[filename] = os.stat(filename).st_size
+        return messages
+
+    def filterMessages(self,messages):
+
+        if self.removeAnonUsers:
+            messages = [x for x in messages if x["user_id"] is not None]
+        if self.trainingMessagesOnly:
+            messages = [x for x in messages if x["data"]["classification"]["subject"]["metadata"]["origin"]=="training"]
+        return messages
+
+    def updateDatabaseInfo(self):
+
+        iuniq = np.unique([x["classification_id"]  for x in self.allMessages],return_index=True)[1]
+
+        if len(iuniq)<len(self.allMessages):
+            print("SQSOfflineClient: Selecting {} unique messages out of {}".format(len(iuniq),len(self.allMessages)))
+            self.allMessages = [self.allMessages[i] for i in iuniq]
+
+        self.messageIds = np.arange(len(self.allMessages))
+
+    def loadInitialMessages(self):
+
+        for filename in np.atleast_1d(self.messagesFilename):
+            messages = self.readPickleFile(filename)
+            messages = self.filterMessages(messages)
+            self.allMessages.extend(messages)
+
+        self.updateDatabaseInfo()
+        print("SQSOfflineClient: Loaded {} messages ...".format(len(self.allMessages)))
+
+    def updateNewMessages(self,sleep=0):
+
+        time.sleep(sleep)
+
+        newMessages = []
+        for filename in np.atleast_1d(self.messagesFilename):
+
+            if os.stat(filename).st_mtime > self.mTimes[filename]:
+                messages = self.readPickleFile(filename)
+                messages = self.filterMessages(messages)
+                newMessages.extend(messages)
+
+        if len(newMessages) > 0:
+            cond = np.in1d([_["classification_id"] for _ in newMessages],
                            [_["classification_id"] for _ in self.allMessages])
             cidx = np.where(~cond)[0]
-            print("SQSOfflineClient: Updated with {} new messages ...".format(len(cidx)))
 
-            self.allMessages.extend([allMessages[idx] for idx in cidx])
-            self.messageIds = np.arange(len(self.allMessages))
+            self.allMessages.extend([newMessages[idx] for idx in cidx])
+            self.updateDatabaseInfo()
+            print("SQSOfflineClient: Updated with {} new messages ...".format(len(cidx)))
 
     def addTrainingFWHM(self, messages):
 
@@ -173,7 +196,7 @@ class SQSOfflineClient:
                     idx = np.where(metadata["id"] == self.trainingFWHM["id"].astype(str))[0][0]
                     metadata[self.sizeMetaDatumName] = self.trainingFWHM["fwhmImagePix"][idx]
                 else:
-                    print("No {} found in message or additional metadata for ID#{}".format(self.sizeMetaDatumName,metadata["id"]))
+                    print("SQSOfflineClient: No {} found in message or in additional metadata for ID#{}".format(self.sizeMetaDatumName,metadata["id"]))
                     pass
 
         return messages

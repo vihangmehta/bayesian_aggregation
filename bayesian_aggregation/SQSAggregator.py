@@ -87,11 +87,11 @@ class SQSAggregator:
                         self.savePath, "{}_{}".format(self.savePrefix, taskLabel)
                     )
                 )
-                self.subAggregators[-1].fname = self.fullSavePrefixes[-1]
+                self.subAggregators[0].fname = self.fullSavePrefixes[0]
 
                 for k,v in self.crowdsourcing_kwargs.items():
-                    if hasattr(self.subAggregators[-1],k):
-                        self.subAggregators[-1].k = v
+                    if hasattr(self.subAggregators[0],k):
+                        setattr(self.subAggregators[0], k, v)
                     else:
                         print("Warning: No {} attribute found for CrowdDatasetBBox. Ignoring.".format(k))
 
@@ -262,8 +262,7 @@ class SQSAggregator:
             elif not stopOnExhaustion:
                 print("No messages received. Waiting...")
                 if self.offlineMode:
-                    time.sleep(60)
-                    self.sqsClient.update()
+                    self.sqsClient.updateNewMessages(sleep=60)
                 continue
             elif retries < 3:
                 print(
